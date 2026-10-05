@@ -1,0 +1,29 @@
+[
+  {
+    "id": "tariff-domestic-2025-01",
+    "meterType": "domestic",
+    "ratePerUnit": 2.8,
+    "fixedCharge": 1000,
+    "effectiveFrom": "2025-01-01",
+    "effectiveTo": "2026-09-30",
+    "status": "inactive"
+  },
+  {
+    "id": "tariff-domestic-2026-10",
+    "meterType": "domestic",
+    "ratePerUnit": 3.25,
+    "fixedCharge": 1200,
+    "effectiveFrom": "2026-10-01",
+    "effectiveTo": null,
+    "status": "active"
+  },
+  {
+    "id": "tariff-commercial-2026-10",
+    "meterType": "commercial",
+    "ratePerUnit": 5.1,
+    "fixedCharge": 2500,
+    "effectiveFrom": "2026-10-01",
+    "effectiveTo": null,
+    "status": "active"
+  }
+]
