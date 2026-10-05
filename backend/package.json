@@ -1,11 +1,12 @@
 {
   "name": "aot-meter-backend",
   "version": "1.0.0",
-  "description": "Backend API for AOT meter reading, OCR validation, anomaly checks, and billing",
+  "description": "AOT Water Meter reading backend with OCR, billing, alerts, and route management",
   "main": "src/server.js",
   "scripts": {
     "dev": "node src/server.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "test": "echo \"No tests yet\" && exit 0"
   },
   "dependencies": {
     "cors": "^2.8.5",

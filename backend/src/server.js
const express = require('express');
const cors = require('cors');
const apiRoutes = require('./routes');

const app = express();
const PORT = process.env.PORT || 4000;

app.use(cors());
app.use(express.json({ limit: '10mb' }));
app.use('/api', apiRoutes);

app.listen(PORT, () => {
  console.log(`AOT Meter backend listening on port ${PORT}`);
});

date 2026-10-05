@@ -1,0 +1,532 @@
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+const { readStore, writeStore, makeId } = require('./store');
+const {
+  findCustomerByMeterNumber,
+  readMeterFromImage,
+  getActiveTariff,
+  buildBillingSummary,
+  createAlert,
+  validateReading,
+  createAuditLog
+} = require('./services');
+
+const upload = multer({ storage: multer.memoryStorage() });
+const router = express.Router();
+
+function respondSuccess(res, data, message = 'Operation successful') {
+  return res.json({ success: true, data, message });
+}
+
+function respondError(res, status, message, code = 'ERROR') {
+  return res.status(status).json({ success: false, error: message, code });
+}
+
+router.get('/health', (req, res) => {
+  respondSuccess(res, { status: 'ok', service: 'AOT meter backend' });
+});
+
+router.post('/customers', (req, res) => {
+  const store = readStore();
+  const payload = req.body;
+
+  if (!payload.customer_number || !payload.customer_name) {
+    return respondError(res, 400, 'customer_number and customer_name are required', 'MISSING_FIELDS');
+  }
+
+  const exists = store.customers.some((item) => item.customer_number === payload.customer_number || item.account_number === payload.account_number);
+  if (exists) {
+    return respondError(res, 409, 'Customer with the same number or account already exists', 'DUPLICATE_CUSTOMER');
+  }
+
+  const customer = {
+    id: makeId('cust'),
+    customer_number: payload.customer_number,
+    account_number: payload.account_number || null,
+    customer_name: payload.customer_name,
+    address: payload.address || null,
+    plot_no: payload.plot_no || null,
+    service_area: payload.service_area || null,
+    service_type: payload.service_type || 'Domestic',
+    index_number: payload.index_number || null,
+    status: payload.status || 'active',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  store.customers.push(customer);
+  writeStore(store);
+
+  createAuditLog({
+    entityType: 'customer',
+    entityId: customer.id,
+    action: 'create',
+    newValues: customer,
+    actorName: 'system'
+  });
+
+  respondSuccess(res, customer, 'Customer created successfully');
+});
+
+router.get('/customers/:customerId', (req, res) => {
+  const store = readStore();
+  const customer = store.customers.find((item) => item.id === req.params.customerId);
+  if (!customer) return respondError(res, 404, 'Customer not found', 'CUSTOMER_NOT_FOUND');
+  respondSuccess(res, customer);
+});
+
+router.get('/customers/search', (req, res) => {
+  const store = readStore();
+  const query = (req.query.q || '').toLowerCase();
+  const results = store.customers.filter((customer) => {
+    const haystack = [
+      customer.customer_name,
+      customer.customer_number,
+      customer.account_number,
+      customer.service_area,
+      customer.service_type,
+      customer.index_number
+    ].join(' ').toLowerCase();
+
+    return !query || haystack.includes(query);
+  });
+
+  respondSuccess(res, results.slice(0, 20));
+});
+
+router.get('/customers/by-meter/:meterNumber', (req, res) => {
+  const store = readStore();
+  const meter = store.meters.find((item) => item.meter_number === req.params.meterNumber);
+  if (!meter) return respondError(res, 404, 'Meter not found', 'METER_NOT_FOUND');
+
+  const customer = store.customers.find((item) => item.id === meter.customer_id);
+  if (!customer) return respondError(res, 404, 'Customer not found for meter', 'CUSTOMER_NOT_FOUND');
+
+  respondSuccess(res, { customer, meter });
+});
+
+router.post('/meters', (req, res) => {
+  const store = readStore();
+  const payload = req.body;
+
+  if (!payload.meter_number || !payload.customer_id) {
+    return respondError(res, 400, 'meter_number and customer_id are required', 'MISSING_FIELDS');
+  }
+
+  const exists = store.meters.some((item) => item.meter_number === payload.meter_number);
+  if (exists) {
+    return respondError(res, 409, 'Meter number already exists', 'DUPLICATE_METER');
+  }
+
+  const customerExists = store.customers.some((item) => item.id === payload.customer_id);
+  if (!customerExists) {
+    return respondError(res, 404, 'Customer does not exist', 'CUSTOMER_NOT_FOUND');
+  }
+
+  const meter = {
+    id: makeId('meter'),
+    meter_number: payload.meter_number,
+    customer_id: payload.customer_id,
+    installation_date: payload.installation_date || null,
+    service_area: payload.service_area || null,
+    meter_status: payload.meter_status || 'active',
+    current_reading: payload.current_reading || null,
+    previous_reading: payload.previous_reading || null,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  store.meters.push(meter);
+  writeStore(store);
+
+  respondSuccess(res, meter, 'Meter created successfully');
+});
+
+router.get('/meters/:meterId', (req, res) => {
+  const store = readStore();
+  const meter = store.meters.find((item) => item.id === req.params.meterId);
+  if (!meter) return respondError(res, 404, 'Meter not found', 'METER_NOT_FOUND');
+  respondSuccess(res, meter);
+});
+
+router.get('/meters/by-customer/:customerId', (req, res) => {
+  const store = readStore();
+  const meters = store.meters.filter((item) => item.customer_id === req.params.customerId);
+  respondSuccess(res, meters);
+});
+
+router.get('/meters/by-number/:meterNumber', (req, res) => {
+  const store = readStore();
+  const meter = store.meters.find((item) => item.meter_number === req.params.meterNumber);
+  if (!meter) return respondError(res, 404, 'Meter not found', 'METER_NOT_FOUND');
+  respondSuccess(res, meter);
+});
+
+router.post('/readings/ocr', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return respondError(res, 400, 'Image file is required', 'MISSING_IMAGE');
+    }
+
+    const result = await readMeterFromImage(req.file.buffer);
+    respondSuccess(res, result, 'OCR reading processed');
+  } catch (err) {
+    return respondError(res, 500, err.message || 'OCR processing failed', 'OCR_FAILED');
+  }
+});
+
+router.post('/readings', (req, res) => {
+  const store = readStore();
+  const payload = req.body;
+
+  if (!payload.meter_id || !payload.customer_id || !payload.current_reading) {
+    return respondError(res, 400, 'meter_id, customer_id and current_reading are required', 'MISSING_FIELDS');
+  }
+
+  const meter = store.meters.find((item) => item.id === payload.meter_id);
+  const customer = store.customers.find((item) => item.id === payload.customer_id);
+
+  if (!meter || !customer) {
+    return respondError(res, 404, 'Meter or customer not found', 'INVALID_METER_CUSTOMER');
+  }
+
+  const previousReading = meter.current_reading ?? meter.previous_reading ?? 0;
+  const validation = validateReading({
+    meter,
+    customer,
+    readingValue: payload.current_reading,
+    previousReading,
+    meterNumber: meter.meter_number
+  });
+
+  if (!validation.ok) {
+    const alert = createAlert({
+      meterId: meter.id,
+      customerId: customer.id,
+      alertType: validation.anomaly || 'reading_validation',
+      severity: validation.status === 'anomaly' ? 'high' : 'medium',
+      message: validation.issue
+    });
+
+    return respondError(res, 400, validation.issue, validation.status === 'anomaly' ? 'READING_ANOMALY' : 'READING_VALIDATION');
+  }
+
+  const reading = {
+    id: makeId('read'),
+    meter_id: meter.id,
+    customer_id: customer.id,
+    officer_id: payload.officer_id || null,
+    reading_date: payload.reading_date || new Date().toISOString(),
+    previous_reading: previousReading,
+    current_reading: Number(payload.current_reading),
+    consumption: Number(payload.current_reading) - Number(previousReading),
+    gps_latitude: payload.gps_latitude || null,
+    gps_longitude: payload.gps_longitude || null,
+    photo_path: payload.photo_path || null,
+    ocr_confidence: payload.ocr_confidence || 1,
+    validation_status: 'validated',
+    anomaly_status: 'normal',
+    anomaly_reason: null,
+    source: 'mobile_app',
+    notes: payload.notes || null,
+    created_at: new Date().toISOString()
+  };
+
+  store.meter_readings.unshift(reading);
+  meter.previous_reading = meter.current_reading;
+  meter.current_reading = Number(payload.current_reading);
+  meter.updated_at = new Date().toISOString();
+
+  writeStore(store);
+
+  createAuditLog({
+    entityType: 'meter_reading',
+    entityId: reading.id,
+    action: 'create',
+    newValues: reading,
+    actorName: 'field_officer'
+  });
+
+  respondSuccess(res, reading, 'Reading submitted successfully');
+});
+
+router.get('/readings/latest/:meterId', (req, res) => {
+  const store = readStore();
+  const reading = store.meter_readings
+    .filter((item) => item.meter_id === req.params.meterId)
+    .sort((a, b) => new Date(b.reading_date) - new Date(a.reading_date))[0];
+
+  if (!reading) return respondError(res, 404, 'No readings found for meter', 'READINGS_NOT_FOUND');
+  respondSuccess(res, reading);
+});
+
+router.get('/readings/history/:meterId', (req, res) => {
+  const store = readStore();
+  const items = store.meter_readings
+    .filter((item) => item.meter_id === req.params.meterId)
+    .sort((a, b) => new Date(b.reading_date) - new Date(a.reading_date));
+
+  respondSuccess(res, items.slice(0, 20));
+});
+
+router.post('/tariffs', (req, res) => {
+  const store = readStore();
+  const payload = req.body;
+
+  if (!payload.service_type || !payload.rate_per_unit || !payload.effective_from) {
+    return respondError(res, 400, 'service_type, rate_per_unit and effective_from are required', 'MISSING_FIELDS');
+  }
+
+  const tariff = {
+    id: makeId('tariff'),
+    service_type: payload.service_type,
+    rate_per_unit: Number(payload.rate_per_unit),
+    fixed_charge: Number(payload.fixed_charge || 0),
+    water_expansion_percentage: Number(payload.water_expansion_percentage || 2),
+    fire_fighting_percentage: Number(payload.fire_fighting_percentage || 1),
+    effective_from: payload.effective_from,
+    effective_to: payload.effective_to || null,
+    status: payload.status || 'active',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  store.tariffs.push(tariff);
+  writeStore(store);
+
+  respondSuccess(res, tariff, 'Tariff added successfully');
+});
+
+router.get('/tariffs/active', (req, res) => {
+  const serviceType = req.query.serviceType || 'Domestic';
+  const date = req.query.date || new Date().toISOString();
+  const tariff = getActiveTariff(serviceType, date);
+
+  if (!tariff) return respondError(res, 404, 'No active tariff found', 'TARIFF_NOT_FOUND');
+  respondSuccess(res, tariff);
+});
+
+router.get('/tariffs/history', (req, res) => {
+  const store = readStore();
+  const serviceType = req.query.serviceType || null;
+  const records = serviceType
+    ? store.tariffs.filter((item) => item.service_type === serviceType)
+    : store.tariffs;
+
+  respondSuccess(res, records.slice().sort((a, b) => new Date(b.effective_from) - new Date(a.effective_from)));
+});
+
+router.post('/bills/calculate', (req, res) => {
+  const payload = req.body;
+
+  if (!payload.customer_id || !payload.meter_id || !payload.current_reading || !payload.previous_reading || !payload.service_type) {
+    return respondError(res, 400, 'customer_id, meter_id, current_reading, previous_reading and service_type are required', 'MISSING_FIELDS');
+  }
+
+  const billing = buildBillingSummary({
+    customerId: payload.customer_id,
+    meterId: payload.meter_id,
+    billingPeriod: payload.billing_period || new Date().toISOString().slice(0, 7),
+    previousReading: payload.previous_reading,
+    currentReading: payload.current_reading,
+    serviceType: payload.service_type
+  });
+
+  if (!billing.ok) {
+    return respondError(res, 400, billing.error, 'BILLING_ERROR');
+  }
+
+  const result = {
+    customer_id: payload.customer_id,
+    meter_id: payload.meter_id,
+    billing_period: payload.billing_period || new Date().toISOString().slice(0, 7),
+    previous_reading: Number(payload.previous_reading),
+    current_reading: Number(payload.current_reading),
+    consumption: billing.consumption,
+    rate_per_unit: billing.ratePerUnit,
+    fixed_charge: billing.fixedCharge,
+    base_amount: billing.baseAmount,
+    water_expansion: billing.waterExpansion,
+    fire_fighting: billing.fireFighting,
+    previous_balance: billing.previousBalance,
+    amount_due: billing.amountDue,
+    total_due: billing.totalDue,
+    status: 'calculated'
+  };
+
+  respondSuccess(res, result, 'Bill calculated successfully');
+});
+
+router.post('/bills/generate-period', (req, res) => {
+  const store = readStore();
+  const payload = req.body;
+  const billingPeriod = payload.billing_period || new Date().toISOString().slice(0, 7);
+
+  const metersToProcess = store.meters.filter((meter) => {
+    if (payload.service_area && meter.service_area !== payload.service_area) return false;
+    if (payload.service_type) {
+      const customer = store.customers.find((item) => item.id === meter.customer_id);
+      if (!customer || customer.service_type !== payload.service_type) return false;
+    }
+    return true;
+  });
+
+  const generated = [];
+
+  for (const meter of metersToProcess) {
+    const customer = store.customers.find((item) => item.id === meter.customer_id);
+    const previousReading = meter.current_reading ?? meter.previous_reading ?? 0;
+    const currentReading = meter.current_reading ?? 0;
+    const serviceType = customer?.service_type || 'Domestic';
+
+    const billing = buildBillingSummary({
+      customerId: customer.id,
+      meterId: meter.id,
+      billingPeriod,
+      previousReading,
+      currentReading,
+      serviceType
+    });
+
+    if (!billing.ok) continue;
+
+    const bill = {
+      id: makeId('bill'),
+      customer_id: customer.id,
+      meter_id: meter.id,
+      tariff_id: billing.tariff.id,
+      billing_period: billingPeriod,
+      previous_reading: previousReading,
+      current_reading: currentReading,
+      consumption: billing.consumption,
+      rate_per_unit: billing.ratePerUnit,
+      fixed_charge: billing.fixedCharge,
+      base_amount: billing.baseAmount,
+      water_expansion: billing.waterExpansion,
+      fire_fighting: billing.fireFighting,
+      previous_balance: billing.previousBalance,
+      amount_due: billing.amountDue,
+      total_due: billing.totalDue,
+      status: 'pending',
+      issued_at: new Date().toISOString(),
+      due_date: new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10),
+      paid_at: null,
+      paid_amount: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    store.bills.push(bill);
+    generated.push(bill);
+  }
+
+  writeStore(store);
+
+  respondSuccess(res, {
+    billing_period: billingPeriod,
+    bills_generated: generated.length,
+    total_amount: generated.reduce((sum, bill) => sum + Number(bill.amount_due || 0), 0)
+  }, 'Bills generated successfully');
+});
+
+router.get('/alerts', (req, res) => {
+  const store = readStore();
+  const status = req.query.status || 'all';
+  let alerts = store.alerts;
+
+  if (status !== 'all') {
+    alerts = alerts.filter((item) => item.status === status);
+  }
+
+  respondSuccess(res, alerts.slice(0, 20));
+});
+
+router.post('/alerts/resolve/:alertId', (req, res) => {
+  const store = readStore();
+  const alert = store.alerts.find((item) => item.id === req.params.alertId);
+  if (!alert) return respondError(res, 404, 'Alert not found', 'ALERT_NOT_FOUND');
+
+  alert.status = 'resolved';
+  alert.resolved_at = new Date().toISOString();
+  alert.resolved_by = req.body.resolved_by || null;
+  writeStore(store);
+
+  respondSuccess(res, alert, 'Alert resolved');
+});
+
+router.get('/reports/daily', (req, res) => {
+  const store = readStore();
+  const totalMeters = store.meters.length;
+  const totalReadings = store.meter_readings.length;
+  const unreadableAlerts = store.alerts.filter((item) => item.alert_type === 'meter_unreadable' && item.status === 'open').length;
+
+  respondSuccess(res, {
+    date: req.query.date || new Date().toISOString().slice(0, 10),
+    service_area: req.query.service_area || 'all',
+    total_meters: totalMeters,
+    total_readings: totalReadings,
+    total_unreadable: unreadableAlerts,
+    total_anomalies: store.alerts.filter((item) => item.status === 'open').length
+  });
+});
+
+router.post('/routes', (req, res) => {
+  const store = readStore();
+  const payload = req.body;
+
+  if (!payload.route_name || !payload.assigned_officer_id) {
+    return respondError(res, 400, 'route_name and assigned_officer_id are required', 'MISSING_FIELDS');
+  }
+
+  const route = {
+    id: makeId('route'),
+    route_name: payload.route_name,
+    assigned_officer_id: payload.assigned_officer_id,
+    service_area: payload.service_area || null,
+    scheduled_date: payload.scheduled_date || new Date().toISOString().slice(0, 10),
+    status: 'pending',
+    total_meters: payload.meter_ids ? payload.meter_ids.length : 0,
+    meters_read: 0,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+
+  store.routes.push(route);
+
+  if (payload.meter_ids && Array.isArray(payload.meter_ids)) {
+    for (const meterId of payload.meter_ids) {
+      store.route_meters = store.route_meters || [];
+      store.route_meters.push({
+        id: makeId('route-meter'),
+        route_id: route.id,
+        meter_id: meterId,
+        status: 'pending',
+        read_at: null,
+        created_at: new Date().toISOString()
+      });
+    }
+  }
+
+  writeStore(store);
+  respondSuccess(res, route, 'Route created successfully');
+});
+
+router.get('/routes/:routeId', (req, res) => {
+  const store = readStore();
+  const route = store.routes.find((item) => item.id === req.params.routeId);
+  if (!route) return respondError(res, 404, 'Route not found', 'ROUTE_NOT_FOUND');
+
+  const meters = (store.route_meters || [])
+    .filter((item) => item.route_id === route.id)
+    .map((item) => ({
+      meter_id: item.meter_id,
+      status: item.status,
+      read_at: item.read_at
+    }));
+
+  respondSuccess(res, { ...route, meters });
+});
+
+module.exports = router;
+
